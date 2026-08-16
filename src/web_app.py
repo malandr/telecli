@@ -11,20 +11,16 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from contextlib import asynccontextmanager
 from starlette.websockets import WebSocketDisconnect
-from pydantic import BaseModel
+from pydantic import ValidationError
 from src.session_manager import SessionManager
 from src.config import Config
-from src.ws_models import MAX_TERMINAL_DIMENSION
+from src.ws_models import MAX_TERMINAL_DIMENSION, WebSocketMessage
 
 logger = logging.getLogger(__name__)
 
 # Global session manager
 session_manager: SessionManager = None
-_session_manager_managed = False
-
-# Global LLM monitor data
-llm_monitor_data = []
-MAX_MONITOR_ENTRIES = 100
+_session_manager_managed = True  # lifespan handles lifecycle by default
 
 
 def _parse_positive_int(raw_value: str | None) -> int | None:
@@ -56,6 +52,11 @@ async def send_json_locked(websocket: WebSocket, payload: dict, send_lock: async
         await websocket.send_json(payload)
     return True
 
+
+# Global LLM monitor data
+llm_monitor_data = []
+MAX_MONITOR_ENTRIES = 100
+
 def add_llm_monitor_entry(entry_type: str, data: dict):
     """Add entry to LLM monitor data"""
     global llm_monitor_data
@@ -74,17 +75,14 @@ def add_llm_monitor_entry(entry_type: str, data: dict):
 async def lifespan(app: FastAPI):
     """Lifespan context manager"""
     global session_manager
-    if session_manager is None:
-        set_session_manager(SessionManager(), managed=True)
-
-    # Pass monitor entry function to session manager
+    if _session_manager_managed:
+        session_manager = SessionManager()
     session_manager.set_monitor_callback(add_llm_monitor_entry)
 
     logger.info("Web app started")
     yield
     if _session_manager_managed and session_manager is not None:
         await session_manager.close_all()
-        set_session_manager(None, managed=False)
     logger.info("Web app stopped")
 
 
@@ -98,23 +96,6 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
 
 # Router for all endpoints to support multiple prefixes
 router = APIRouter()
-
-
-class CreateSessionRequest(BaseModel):
-    name: str | None = None
-
-
-class RenameSessionRequest(BaseModel):
-    name: str
-
-
-class ImportTmuxSessionRequest(BaseModel):
-    tmux_session_name: str
-    name: str | None = None
-
-
-class CreateTmuxSessionRequest(BaseModel):
-    name: str
 
 @router.get("/")
 async def get_root():
@@ -157,69 +138,86 @@ async def get_stats():
 
 @router.get("/api/sessions")
 async def get_active_sessions():
-    """Get list of active sessions"""
+    """Get TeleCLI session entries for the session picker."""
     return {"sessions": session_manager.list_sessions()}
+
+@router.get("/api/tmux/sessions")
+async def get_tmux_sessions():
+    """List machine tmux sessions."""
+    return {"sessions": session_manager.list_machine_tmux_sessions()}
+
+
+@router.post("/api/tmux/sessions")
+async def create_tmux_session(request: Request):
+    """Create a new tmux session and import it into TeleCLI."""
+    body = await request.json() if request.headers.get("content-length") else {}
+    tmux_session_name = body.get("name", "").strip()
+    if not tmux_session_name:
+        raise HTTPException(status_code=400, detail="tmux session name is required")
+
+    try:
+        result = session_manager.create_tmux_session_entry(tmux_session_name)
+        return {"session": result}
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 @router.post("/api/sessions")
-async def create_session(request: CreateSessionRequest):
-    """Create a named TeleCLI-only session entry."""
-    return {"session": session_manager.create_session_entry(request.name)}
+async def create_session(request: Request):
+    """Create a new TeleCLI session entry."""
+    body = await request.json() if request.headers.get("content-length") else {}
+    name = body.get("name", "").strip() or None
+    result = session_manager.create_session_entry(name=name)
+    return {"session": result}
 
 
 @router.patch("/api/sessions/{session_id}")
-async def rename_session(session_id: str, request: RenameSessionRequest):
-    """Rename a TeleCLI session entry."""
+async def patch_session(session_id: str, request: Request):
+    """Rename a session."""
+    body = await request.json()
+    new_name = body.get("name", "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="name is required")
     try:
-        return {"session": session_manager.rename_session(session_id, request.name)}
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Session not found")
+        result = session_manager.rename_session(session_id, new_name)
+        return {"session": result}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/api/sessions/{session_id}")
-async def delete_session_entry(session_id: str):
-    """Delete a session entry from TeleCLI."""
+async def delete_session(session_id: str):
+    """Delete a session entry."""
     await session_manager.delete_session_entry(session_id)
     return {"status": "ok"}
 
 
-@router.get("/api/tmux/sessions")
-async def get_machine_tmux_sessions():
-    """List tmux sessions currently available on the machine."""
-    return {"sessions": session_manager.list_machine_tmux_sessions()}
-
-
-@router.post("/api/tmux/sessions")
-async def create_tmux_session(request: CreateTmuxSessionRequest):
-    """Create a new machine tmux session and import it into TeleCLI."""
+@router.post("/api/sessions/{session_id}/detach")
+async def detach_tmux_session(session_id: str):
+    """Detach a tmux session from TeleCLI."""
     try:
-        return {"session": session_manager.create_tmux_session_entry(request.name)}
-    except ValueError as e:
+        result = await session_manager.detach_tmux_session(session_id)
+        return {"session": result}
+    except (KeyError, ValueError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/api/sessions/import-tmux")
-async def import_tmux_session(request: ImportTmuxSessionRequest):
+async def import_tmux_session(request: Request):
     """Import an existing machine tmux session into TeleCLI."""
+    body = await request.json()
+    tmux_session_name = body.get("tmux_session_name", "").strip()
+    if not tmux_session_name:
+        raise HTTPException(status_code=400, detail="tmux_session_name is required")
+    name = body.get("name", "").strip() or None
     try:
-        return {"session": session_manager.import_tmux_session(request.tmux_session_name, request.name)}
-    except KeyError:
-        raise HTTPException(status_code=404, detail="tmux session not found")
+        result = session_manager.import_tmux_session(tmux_session_name, name=name)
+        return {"session": result}
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-
-@router.post("/api/sessions/{session_id}/detach")
-async def detach_tmux_session(session_id: str):
-    """Detach TeleCLI from a tmux-backed session while keeping the imported entry."""
-    try:
-        return {"session": await session_manager.detach_tmux_session(session_id)}
-    except KeyError:
-        raise HTTPException(status_code=404, detail="Session not found")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/api/llm-monitor")
 async def get_llm_monitor_data():
@@ -302,6 +300,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     async def claude_code_status_callback(status: dict):
         await safe_send_json({"claude_code_status": status})
 
+    async def browser_agent_status_callback(status: dict):
+        await safe_send_json({"browser_agent": status})
+
     # Hook into AI proxy if it exists
     ai_proxy = session_manager.get_ai_proxy(client_id)
     if ai_proxy:
@@ -321,6 +322,13 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         if not await safe_send_json({"claude_code_status": {"enabled": False}}):
             return
 
+    # Re-bind the browser-agent status callback if a run/approvals persisted from an earlier connection
+    existing_browser_agent = session_manager.get_browser_agent(client_id)
+    if existing_browser_agent:
+        existing_browser_agent.set_status_callback(browser_agent_status_callback)
+    if not await safe_send_json({"browser_agent": session_manager.get_browser_agent_status(client_id)}):
+        return
+
     try:
         capabilities = session_manager.get_session_mode_capabilities(client_id)
     except Exception:
@@ -338,6 +346,18 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         else:
             if current_screen and not await safe_send_json({"output": current_screen}):
                 return
+    elif client_id in session_manager.sessions:
+        # Non-tmux backend has no direct screen-capture — nudge a redraw instead.
+        try:
+            session = await session_manager.get_session(client_id)
+            await asyncio.sleep(0.2)
+            await session.send_input(" \b", newline=False)
+            await asyncio.sleep(0.1)
+            await session.send_input("", newline=True)
+            await asyncio.sleep(0.1)
+            await session.send_input("\x0C", newline=False)
+        except Exception as e:
+            logger.warning(f"Could not refresh terminal for {client_id}: {e}")
 
     async def handle_input():
         nonlocal connection_active
@@ -345,57 +365,93 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             while connection_active:
                 data = await websocket.receive_text()
                 try:
-                    message = json.loads(data)
-                    input_text = message.get("input", "")
-                    if input_text:
-                        await session_manager.send_input(client_id, input_text, newline=False, from_ai=False)
-                        # Notify proxy of user interaction
-                        ai_proxy = session_manager.get_ai_proxy(client_id)
-                        if ai_proxy and ai_proxy.is_enabled():
-                            ai_proxy.notify_user_input(input_text)
-
-                    if "resize" in message:
-                        await session_manager.resize_session(
-                            client_id,
-                            message["resize"].get("rows", 24),
-                            message["resize"].get("cols", 80)
-                        )
-
-                    if "proxy" in message:
-                        proxy_cmd = message["proxy"]
-                        if proxy_cmd.get("enable"):
-                            success = await session_manager.enable_ai_proxy(
-                                client_id,
-                                proxy_cmd.get("provider"),
-                                proxy_cmd.get("system_prompt")
-                            )
-                            if success:
-                                ai_proxy = session_manager.get_ai_proxy(client_id)
-                                if ai_proxy:
-                                    ai_proxy.set_monitor_callback(llm_monitor_callback)
-                                    await safe_send_json({"proxy_status": ai_proxy.get_status()})
-                        elif proxy_cmd.get("disable"):
-                            await session_manager.disable_ai_proxy(client_id)
-                            await safe_send_json({"proxy_status": {"enabled": False}})
-
-                    if "claude_code" in message:
-                        claude_code_cmd = message["claude_code"]
-                        if claude_code_cmd.get("enable"):
-                            success = await session_manager.enable_claude_code_auto_continue(client_id)
-                            if success:
-                                claude_code_auto = session_manager.get_claude_code_auto_continue(client_id)
-                                if claude_code_auto:
-                                    claude_code_auto.set_status_callback(claude_code_status_callback)
-                                    await safe_send_json({"claude_code_status": claude_code_auto.get_status()})
-                        elif claude_code_cmd.get("disable"):
-                            await session_manager.disable_claude_code_auto_continue(client_id)
-                            await safe_send_json({"claude_code_status": {"enabled": False}})
-                        elif claude_code_cmd.get("screen_text"):
-                            claude_code_auto = session_manager.get_claude_code_auto_continue(client_id)
-                            if claude_code_auto and claude_code_auto.is_enabled():
-                                claude_code_auto.inspect_screen_text(claude_code_cmd["screen_text"])
+                    raw_message = json.loads(data)
                 except json.JSONDecodeError:
-                    pass
+                    continue
+
+                try:
+                    message = WebSocketMessage.model_validate(raw_message)
+                except ValidationError:
+                    continue
+
+                if message.input:
+                    await session_manager.send_input(client_id, message.input, newline=False, from_ai=False)
+                    # Notify proxy of user interaction
+                    ai_proxy = session_manager.get_ai_proxy(client_id)
+                    if ai_proxy and ai_proxy.is_enabled():
+                        ai_proxy.notify_user_input(message.input)
+
+                if message.resize:
+                    await session_manager.resize_session(
+                        client_id,
+                        message.resize.rows,
+                        message.resize.cols,
+                    )
+
+                if message.proxy:
+                    proxy_cmd = message.proxy
+                    if proxy_cmd.enable:
+                        success = await session_manager.enable_ai_proxy(
+                            client_id,
+                            proxy_cmd.provider,
+                            proxy_cmd.system_prompt,
+                        )
+                        if success:
+                            ai_proxy = session_manager.get_ai_proxy(client_id)
+                            if ai_proxy:
+                                ai_proxy.set_monitor_callback(llm_monitor_callback)
+                                await safe_send_json({"proxy_status": ai_proxy.get_status()})
+                    elif proxy_cmd.disable:
+                        await session_manager.disable_ai_proxy(client_id)
+                        await safe_send_json({"proxy_status": {"enabled": False}})
+
+                if message.claude_code:
+                    claude_code_cmd = message.claude_code
+                    if claude_code_cmd.enable:
+                        success = await session_manager.enable_claude_code_auto_continue(client_id)
+                        if success:
+                            claude_code_auto = session_manager.get_claude_code_auto_continue(client_id)
+                            if claude_code_auto:
+                                claude_code_auto.set_status_callback(claude_code_status_callback)
+                                await safe_send_json({"claude_code_status": claude_code_auto.get_status()})
+                    elif claude_code_cmd.disable:
+                        await session_manager.disable_claude_code_auto_continue(client_id)
+                        await safe_send_json({"claude_code_status": {"enabled": False}})
+                    elif claude_code_cmd.screen_text:
+                        claude_code_auto = session_manager.get_claude_code_auto_continue(client_id)
+                        if claude_code_auto and claude_code_auto.is_enabled():
+                            claude_code_auto.inspect_screen_text(claude_code_cmd.screen_text)
+
+                if message.browser_agent:
+                    browser_agent_cmd = message.browser_agent
+                    if browser_agent_cmd.submit:
+                        submit = browser_agent_cmd.submit
+                        try:
+                            await session_manager.start_browser_agent_run(
+                                client_id,
+                                prompt=submit.prompt,
+                                provider_name=submit.provider,
+                                state_callback=browser_agent_status_callback,
+                            )
+                        except Exception as exc:
+                            logger.warning("Browser agent submit failed for %s: %s", client_id, exc)
+                            status = session_manager.get_browser_agent_status(client_id)
+                            status["error"] = str(exc)
+                            await safe_send_json({"browser_agent": status})
+                    elif browser_agent_cmd.approve:
+                        approve = browser_agent_cmd.approve
+                        try:
+                            await session_manager.approve_browser_agent_run(
+                                client_id,
+                                target=approve.target,
+                                scope=approve.scope,
+                                command_ids=approve.command_ids,
+                                pattern=approve.pattern,
+                            )
+                        except Exception as exc:
+                            logger.warning("Browser agent approve failed for %s: %s", client_id, exc)
+                    elif browser_agent_cmd.stop:
+                        await session_manager.stop_browser_agent_run(client_id)
         except WebSocketDisconnect:
             connection_active = False
         except Exception as e:
@@ -453,6 +509,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         claude_code_auto = session_manager.get_claude_code_auto_continue(client_id)
         if claude_code_auto:
             claude_code_auto.set_status_callback(None)
+        browser_agent = session_manager.get_browser_agent(client_id)
+        if browser_agent:
+            browser_agent.set_status_callback(None)
         # Session is NOT closed here to allow persistence & reconnection
         # sessions are managed by max_sessions policy in SessionManager
         logger.info(f"WebSocket disconnected for {client_id}, session kept alive")
