@@ -232,12 +232,16 @@ class BrowserAgentController:
             elif normalized_scope != 'once':
                 raise ValueError(f'Unknown approval scope: {scope}')
 
-            if target == 'plan':
-                self.force_command_review = False
-                await self._execute_remaining(ignore_approval=True)
-                return
+            run_plan = target == 'plan'
+            self.force_command_review = not run_plan
 
-            self.force_command_review = True
+        # Execute outside the lock — this can run an arbitrarily long shell
+        # command, and holding the lock here would block stop() (and
+        # submit_request()) from acquiring it, making a run impossible to
+        # interrupt promptly.
+        if run_plan:
+            await self._execute_remaining(ignore_approval=True)
+        else:
             await self._execute_current(ignore_approval=True)
             await self._advance_execution()
 

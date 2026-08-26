@@ -73,6 +73,50 @@ async def test_browser_agent_plan_once_executes_all_commands():
 
 
 @pytest.mark.asyncio
+async def test_stop_interrupts_promptly_during_long_running_approved_execution():
+    """approve() must not hold the controller lock for the duration of command
+    execution, or stop() (and submit_request()) can't acquire it to interrupt
+    a run that's stuck on a long-running command."""
+    command_started = asyncio.Event()
+    release_command = asyncio.Event()
+    interrupted = []
+
+    async def execute(command: str) -> None:
+        command_started.set()
+        await release_command.wait()
+
+    async def interrupt() -> None:
+        interrupted.append(True)
+        release_command.set()
+
+    controller = BrowserAgentController(
+        llm_provider=FakeProvider(
+            {
+                "summary": "Long task",
+                "commands": [{"command": "sleep 100"}],
+            }
+        ),
+        execute_command_callback=execute,
+        interrupt_command_callback=interrupt,
+    )
+
+    await controller.submit_request("run something slow")
+    await asyncio.wait_for(controller._task, timeout=1)
+
+    approve_task = asyncio.create_task(controller.approve(scope="once", target="plan"))
+    await asyncio.wait_for(command_started.wait(), timeout=1)
+
+    # The lock must be free here even though approve_task is still awaiting
+    # the (blocked) command execution — this hangs before the fix.
+    await asyncio.wait_for(controller.stop(), timeout=1)
+
+    assert interrupted == [True]
+    assert controller.get_status()["status"] == "stopped"
+
+    await asyncio.wait_for(approve_task, timeout=1)
+
+
+@pytest.mark.asyncio
 async def test_browser_agent_pattern_approval_persists_for_session():
     executed = []
 

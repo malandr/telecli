@@ -329,3 +329,19 @@ def test_root_page_includes_browser_agent_panel_markup():
         assert 'browser-agent-panel' in body
         assert 'Ask mode' in body
         assert 'browser-agent-commands' in body
+
+
+def test_root_page_checks_awaiting_approval_state_not_pending():
+    """BrowserAgentController flips the current command's state to
+    'awaiting_approval' (see src/browser_agent.py), never leaves it as
+    'pending' — the approval buttons must key off that value, or the
+    plan/per-command approval UI silently never renders."""
+    with TestClient(app) as client:
+        response = client.get("/")
+
+        assert response.status_code == 200
+        body = response.text
+        assert "command.state === 'pending'" not in body
+        assert "cmd.state === 'pending'" not in body
+        assert "command.state === 'awaiting_approval'" in body
+        assert "cmd.state === 'awaiting_approval'" in body

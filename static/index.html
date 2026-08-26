@@ -544,7 +544,7 @@
 
             const approvalMode = browserAgentState?.approval_mode || 'idle';
             const pendingCommandId = browserAgentState?.pending_command_id || null;
-            const pendingCommands = (browserAgentState?.commands || []).filter((command) => command.state === 'pending');
+            const pendingCommands = (browserAgentState?.commands || []).filter((command) => command.state === 'awaiting_approval');
 
             if (state === 'awaiting_approval' && approvalMode === 'plan' && pendingCommands.length > 0) {
                 approvalsEl.style.display = 'block';
@@ -567,7 +567,7 @@
             if (commands.length > 0) {
                 commandsEl.style.display = 'grid';
                 commandsEl.innerHTML = commands.map((cmd) => {
-                    const isAwaiting = state === 'awaiting_approval' && cmd.state === 'pending' && (!pendingCommandId || cmd.id === pendingCommandId);
+                    const isAwaiting = state === 'awaiting_approval' && cmd.state === 'awaiting_approval' && (!pendingCommandId || cmd.id === pendingCommandId);
                     const commandActions = isAwaiting ? `
                         <div class="browser-agent-command-actions">
                             <button onclick="approveBrowserAgentCommand('${escapeHtml(cmd.id)}', 'once')">Once</button>
