@@ -111,6 +111,12 @@ def test_websocket_sends_tmux_screen_snapshot_on_connect(client, client_id, monk
         def get_claude_code_auto_continue(self, _session_id):
             return None
 
+        def get_browser_agent(self, _session_id):
+            return None
+
+        def get_browser_agent_status(self, _session_id):
+            return {}
+
         def get_session_mode_capabilities(self, _session_id):
             return {
                 "backend": "tmux",
@@ -149,6 +155,12 @@ def test_websocket_passes_initial_terminal_size_to_output_stream(client, client_
 
         def get_claude_code_auto_continue(self, _session_id):
             return None
+
+        def get_browser_agent(self, _session_id):
+            return None
+
+        def get_browser_agent_status(self, _session_id):
+            return {}
 
         def get_session_mode_capabilities(self, _session_id):
             return {
@@ -193,6 +205,12 @@ def test_websocket_clamps_initial_terminal_size_query_params(client, client_id, 
         def get_claude_code_auto_continue(self, _session_id):
             return None
 
+        def get_browser_agent(self, _session_id):
+            return None
+
+        def get_browser_agent_status(self, _session_id):
+            return {}
+
         def get_session_mode_capabilities(self, _session_id):
             return {
                 "backend": "tmux",
@@ -229,11 +247,19 @@ def test_websocket_logs_capability_lookup_failures(client, client_id, monkeypatc
     """Capability lookup failures should be logged before the websocket falls back."""
 
     class FakeSessionManager:
+        sessions: dict = {}
+
         def get_ai_proxy(self, _session_id):
             return None
 
         def get_claude_code_auto_continue(self, _session_id):
             return None
+
+        def get_browser_agent(self, _session_id):
+            return None
+
+        def get_browser_agent_status(self, _session_id):
+            return {}
 
         def get_session_mode_capabilities(self, _session_id):
             raise RuntimeError("capability probe failed")
@@ -269,6 +295,12 @@ def test_websocket_offloads_tmux_screen_capture_to_thread(client, client_id, mon
 
         def get_claude_code_auto_continue(self, _session_id):
             return None
+
+        def get_browser_agent(self, _session_id):
+            return None
+
+        def get_browser_agent_status(self, _session_id):
+            return {}
 
         def get_session_mode_capabilities(self, _session_id):
             return {
