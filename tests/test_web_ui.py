@@ -19,6 +19,16 @@ def test_root_path_serves_index_html():
         assert response.headers["content-type"] in ["text/html; charset=utf-8", "text/html"]
 
 
+def test_root_page_includes_browser_agent_panel():
+    """The browser UI should expose the ask-mode panel shell for Alt+Enter workflows."""
+    with TestClient(app) as client:
+        response = client.get("/")
+        assert response.status_code == 200
+        body = response.text
+        assert 'browser-agent-panel' in body
+        assert 'Press Alt+Enter to send the current shell draft to the LLM.' in body
+
+
 def test_telecli_path_serves_index_html():
     """Test that GET /telecli also serves the index.html"""
     with TestClient(app) as client:
@@ -307,3 +317,31 @@ def test_static_file_paths_are_registered():
     routes_summary = [str(route) for route in app.routes]
     # At least one route should exist
     assert len(routes_summary) > 0
+
+
+def test_root_page_includes_browser_agent_panel_markup():
+    """The web UI should render the Ask-mode panel scaffold."""
+    with TestClient(app) as client:
+        response = client.get("/")
+
+        assert response.status_code == 200
+        body = response.text
+        assert 'browser-agent-panel' in body
+        assert 'Ask mode' in body
+        assert 'browser-agent-commands' in body
+
+
+def test_root_page_checks_awaiting_approval_state_not_pending():
+    """BrowserAgentController flips the current command's state to
+    'awaiting_approval' (see src/browser_agent.py), never leaves it as
+    'pending' — the approval buttons must key off that value, or the
+    plan/per-command approval UI silently never renders."""
+    with TestClient(app) as client:
+        response = client.get("/")
+
+        assert response.status_code == 200
+        body = response.text
+        assert "command.state === 'pending'" not in body
+        assert "cmd.state === 'pending'" not in body
+        assert "command.state === 'awaiting_approval'" in body
+        assert "cmd.state === 'awaiting_approval'" in body

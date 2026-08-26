@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from src.ai_proxy import AIProxy
+from src.browser_agent import ASK_MODE_SYSTEM_PROMPT, BrowserAgentController
 from src.claude_code_auto_continue import ClaudeCodeAutoContinue
 from src.config import Config
 from src.llm_provider import LLMProviderFactory
@@ -71,6 +72,7 @@ class SessionManager:
         self.session_records: dict[str, SessionRecord] = {}
         self.session_count = 0
         self.ai_proxies: dict[str, AIProxy] = {}
+        self.browser_agents: dict[str, BrowserAgentController] = {}
         self.claude_code_auto_controllers: dict[str, ClaudeCodeAutoContinue] = {}
         self.monitor_callback = None
         self._tmux_availability_cache: dict[str, tuple[float, bool]] = {}
@@ -509,6 +511,12 @@ class SessionManager:
         """Offload blocking tmux key sending for async callers."""
         await asyncio.to_thread(self.send_special_key, session_id, key_name)
 
+    async def execute_session_command(self, session_id: str, command: str, timeout: Optional[float] = None) -> str:
+        """Execute a command via the session marker flow and wait for completion."""
+        session = await self.get_session(session_id)
+        resolved_timeout = Config.TERMINAL_TIMEOUT if timeout is None else timeout
+        return await session.send_command(command, timeout=resolved_timeout)
+
     async def enable_ai_proxy(
         self,
         session_id: Optional[str] = None,
@@ -575,6 +583,141 @@ class SessionManager:
         """Get AI proxy for a session."""
         return self.ai_proxies.get(session_id)
 
+    def _get_or_create_browser_agent_controller(
+        self,
+        session_id: str,
+        *,
+        provider_name: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+    ) -> BrowserAgentController:
+        if session_id not in self.session_records and session_id not in self.sessions:
+            self._ensure_record(session_id, backend="telecli")
+
+        provider_name = provider_name or Config.AI_PROXY_PROVIDER
+        llm_provider = LLMProviderFactory.create(provider_name)
+        if not llm_provider:
+            raise RuntimeError(f"Browser agent provider unavailable: {provider_name}")
+
+        controller = self.browser_agents.get(session_id)
+        if controller is None:
+            controller = BrowserAgentController(
+                llm_provider=llm_provider,
+                provider_name=provider_name,
+                system_prompt=system_prompt or ASK_MODE_SYSTEM_PROMPT,
+                execute_command_callback=lambda command: self.execute_session_command(session_id, command),
+                interrupt_command_callback=lambda: self.send_input(session_id, "\x03", newline=False, from_ai=True),
+                session_id=session_id,
+            )
+            self.browser_agents[session_id] = controller
+        else:
+            controller.llm_provider = llm_provider
+            controller.provider_name = provider_name
+            if system_prompt:
+                controller.system_prompt = system_prompt
+        return controller
+
+    async def set_browser_agent_event_callback(self, session_id: str, callback) -> None:
+        controller = self.browser_agents.get(session_id)
+        if controller:
+            controller.set_status_callback(callback)
+
+    async def start_browser_agent_run(
+        self,
+        session_id: str,
+        *,
+        prompt: str,
+        provider_name: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        state_callback=None,
+    ) -> dict:
+        """Start or replace a browser ask-mode run for a session."""
+        controller = self._get_or_create_browser_agent_controller(
+            session_id,
+            provider_name=provider_name,
+            system_prompt=system_prompt,
+        )
+        controller.set_state_callback(state_callback)
+        session = await self.get_session(session_id)
+        await controller.submit_request(prompt, session_context=session.get_recent_output())
+        return controller.get_status()
+
+    async def approve_browser_agent_run(
+        self,
+        session_id: str,
+        *,
+        target: str,
+        scope: str,
+        command_ids: Optional[list[int | str]] = None,
+        pattern: Optional[str] = None,
+    ) -> dict:
+        controller = self.browser_agents.get(session_id)
+        if not controller:
+            raise RuntimeError("Browser agent is not active for this session")
+        await controller.approve(target=target, scope=scope, command_ids=command_ids, pattern=pattern)
+        return controller.get_status()
+
+    async def review_browser_agent_plan(self, session_id: str) -> bool:
+        await self.approve_browser_agent_run(
+            session_id,
+            target="review",
+            scope="once",
+            command_ids=None,
+            pattern=None,
+        )
+        return True
+
+    async def approve_browser_agent_plan(self, session_id: str, scope: str) -> bool:
+        await self.approve_browser_agent_run(
+            session_id,
+            target="plan",
+            scope=scope,
+            command_ids=None,
+            pattern=None,
+        )
+        return True
+
+    async def approve_browser_agent_command(
+        self,
+        session_id: str,
+        command_id: str,
+        scope: str,
+        *,
+        pattern: Optional[str] = None,
+    ) -> bool:
+        await self.approve_browser_agent_run(
+            session_id,
+            target="command",
+            scope=scope,
+            command_ids=[command_id],
+            pattern=pattern,
+        )
+        return True
+
+    async def stop_browser_agent_run(self, session_id: str) -> dict:
+        controller = self.browser_agents.get(session_id)
+        if not controller:
+            return self.get_browser_agent_status(session_id)
+        await controller.stop()
+        return controller.get_status()
+
+    async def clear_browser_agent(self, session_id: str) -> None:
+        controller = self.browser_agents.pop(session_id, None)
+        if controller:
+            controller.set_status_callback(None)
+            await controller.stop()
+
+    def get_browser_agent(self, session_id: str) -> Optional[BrowserAgentController]:
+        return self.browser_agents.get(session_id)
+
+    def get_browser_agent_status(self, session_id: str) -> dict:
+        controller = self.browser_agents.get(session_id)
+        if not controller:
+            return BrowserAgentController.idle_payload()
+        return controller.get_status()
+
+    def get_browser_agent_state(self, session_id: str) -> dict:
+        return self.get_browser_agent_status(session_id)
+
     async def enable_claude_code_auto_continue(self, session_id: str) -> bool:
         """Enable Claude Code usage-reset auto-continue for a session."""
         session = await self.get_session(session_id)
@@ -610,17 +753,19 @@ class SessionManager:
         """Close an active runtime session but keep its metadata entry."""
         session_exists = session_id in self.sessions
         ai_proxy_exists = session_id in self.ai_proxies
+        browser_agent_exists = session_id in self.browser_agents
         claude_auto_exists = session_id in self.claude_code_auto_controllers
 
-        if not session_exists and not ai_proxy_exists and not claude_auto_exists:
+        if not session_exists and not ai_proxy_exists and not browser_agent_exists and not claude_auto_exists:
             logger.debug("Session %s already closed or doesn't exist", session_id)
             return
 
         logger.info(
-            "Closing session %s (session_exists=%s, ai_proxy_exists=%s, claude_auto_exists=%s)",
+            "Closing session %s (session_exists=%s, ai_proxy_exists=%s, browser_agent_exists=%s, claude_auto_exists=%s)",
             session_id,
             session_exists,
             ai_proxy_exists,
+            browser_agent_exists,
             claude_auto_exists,
         )
 
@@ -630,6 +775,12 @@ class SessionManager:
                     await self.disable_ai_proxy(session_id)
                 except Exception as e:
                     logger.error("Error disabling AI proxy for session %s: %s", session_id, e)
+
+            if browser_agent_exists:
+                try:
+                    await self.clear_browser_agent(session_id)
+                except Exception as e:
+                    logger.error("Error clearing browser agent for session %s: %s", session_id, e)
 
             if claude_auto_exists:
                 try:
@@ -651,7 +802,10 @@ class SessionManager:
 
     async def close_all(self) -> None:
         """Close all active runtime sessions."""
-        session_ids = list(self.sessions.keys())
+        session_ids = set(self.sessions.keys())
+        session_ids.update(self.ai_proxies.keys())
+        session_ids.update(self.browser_agents.keys())
+        session_ids.update(self.claude_code_auto_controllers.keys())
         for session_id in session_ids:
             await self.close_session(session_id)
         logger.info("All sessions closed")
@@ -662,6 +816,8 @@ class SessionManager:
             "active_sessions": len(self.sessions),
             "max_sessions": self.max_sessions,
             "total_created": self.session_count,
+            "ai_proxy_sessions": len(self.ai_proxies),
+            "browser_agent_sessions": len(self.browser_agents),
         }
 
     def set_monitor_callback(self, callback):

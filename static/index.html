@@ -244,6 +244,22 @@
             <!-- Terminal Panel -->
             <div class="terminal-panel" id="terminal-panel">
                 <div class="terminal" id="terminal-container"></div>
+                <section class="browser-agent-panel browser-agent-hidden" id="browser-agent-panel" aria-live="polite">
+                    <div class="browser-agent-header">
+                        <div>
+                            <strong>✨ Ask mode</strong>
+                            <span id="browser-agent-state-label" class="browser-agent-state-pill">Idle</span>
+                        </div>
+                        <div class="browser-agent-header-actions">
+                            <button id="browser-agent-stop-btn" onclick="stopBrowserAgentRun()" style="display: none;">⏹ Stop</button>
+                        </div>
+                    </div>
+                    <div id="browser-agent-summary" class="browser-agent-summary">Press Alt+Enter to send the current shell draft to the LLM.</div>
+                    <div id="browser-agent-prompt" class="browser-agent-prompt" style="display: none;"></div>
+                    <div id="browser-agent-notice" class="browser-agent-notice" style="display: none;"></div>
+                    <div id="browser-agent-approvals" class="browser-agent-approvals" style="display: none;"></div>
+                    <div id="browser-agent-commands" class="browser-agent-commands" style="display: none;"></div>
+                </section>
                 <footer>
                     <div id="status">Connecting...</div>
                     <div id="stats"></div>
@@ -323,6 +339,10 @@
         let staleStateCheckInterval = null;
         let terminalRefreshAttempts = 0;
         let recoveryMessageShown = false;
+        let browserAgentState = { status: 'idle', commands: [] };
+        let browserDraftBuffer = '';
+        let browserDraftTrusted = true;
+        let browserDraftUntrustedReason = '';
 
         function getBasePath() {
             return window.location.pathname.replace(/\/$/, '');
@@ -424,6 +444,251 @@
             claudeCodeRenderedScreenCheckTimeoutId = setTimeout(() => {
                 reportClaudeCodeRenderedScreenIfNeeded();
             }, delayMs);
+        }
+
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#39;');
+        }
+
+        function resetBrowserDraftBuffer() {
+            browserDraftBuffer = '';
+            browserDraftTrusted = true;
+            browserDraftUntrustedReason = '';
+        }
+
+        function markBrowserDraftUntrusted(reason) {
+            browserDraftTrusted = false;
+            browserDraftUntrustedReason = reason;
+        }
+
+        function updateBrowserDraftBufferFromInput(data) {
+            if (!data) {
+                return;
+            }
+
+            if (data === '\r') {
+                resetBrowserDraftBuffer();
+                return;
+            }
+
+            if (data === '\u007f') {
+                if (browserDraftTrusted && browserDraftBuffer.length > 0) {
+                    browserDraftBuffer = browserDraftBuffer.slice(0, -1);
+                }
+                return;
+            }
+
+            if (data === '\u0015' || data === '\u0003' || data === '\u000c') {
+                resetBrowserDraftBuffer();
+                return;
+            }
+
+            if (data.startsWith('\u001b')) {
+                markBrowserDraftUntrusted('Ask mode is unavailable while using history/raw terminal controls.');
+                return;
+            }
+
+            const printable = /^[\x20-\x7E]+$/.test(data);
+            if (printable && browserDraftTrusted) {
+                browserDraftBuffer += data;
+                return;
+            }
+
+            markBrowserDraftUntrusted('Ask mode is unavailable in this interactive/raw terminal state.');
+        }
+
+        function getAskModeNotice() {
+            if (!browserDraftTrusted) {
+                return browserDraftUntrustedReason || 'Ask mode is unavailable in the current terminal state.';
+            }
+            if (!browserDraftBuffer.trim()) {
+                return 'Type a line of shell input first, then press Alt+Enter.';
+            }
+            return '';
+        }
+
+        function renderBrowserAgentPanel() {
+            const panel = document.getElementById('browser-agent-panel');
+            const stateLabel = document.getElementById('browser-agent-state-label');
+            const summaryEl = document.getElementById('browser-agent-summary');
+            const promptEl = document.getElementById('browser-agent-prompt');
+            const noticeEl = document.getElementById('browser-agent-notice');
+            const approvalsEl = document.getElementById('browser-agent-approvals');
+            const commandsEl = document.getElementById('browser-agent-commands');
+            const stopBtn = document.getElementById('browser-agent-stop-btn');
+
+            const state = browserAgentState?.status || browserAgentState?.state || 'idle';
+            const isActive = state !== 'idle' || !!browserAgentState?.notice;
+            panel.classList.toggle('browser-agent-hidden', !isActive);
+            stateLabel.textContent = state.replaceAll('_', ' ');
+            stateLabel.className = `browser-agent-state-pill browser-agent-state-${state}`;
+
+            const summary = browserAgentState?.summary
+                || (state === 'idle'
+                    ? 'Press Alt+Enter to send the current shell draft to the LLM.'
+                    : 'TeleCLI is processing your ask-mode request.');
+            summaryEl.textContent = summary;
+
+            const prompt = browserAgentState?.prompt || '';
+            promptEl.style.display = prompt ? 'block' : 'none';
+            promptEl.innerHTML = prompt ? `<span>Request:</span> ${escapeHtml(prompt)}` : '';
+
+            const notice = browserAgentState?.notice || '';
+            noticeEl.style.display = notice ? 'block' : 'none';
+            noticeEl.textContent = notice;
+
+            const approvalMode = browserAgentState?.approval_mode || 'idle';
+            const pendingCommandId = browserAgentState?.pending_command_id || null;
+            const pendingCommands = (browserAgentState?.commands || []).filter((command) => command.state === 'awaiting_approval');
+
+            if (state === 'awaiting_approval' && approvalMode === 'plan' && pendingCommands.length > 0) {
+                approvalsEl.style.display = 'block';
+                approvalsEl.innerHTML = `
+                    <div class="browser-agent-approval-copy">
+                        Approve the full proposal or choose per-command controls below.
+                    </div>
+                    <div class="browser-agent-approval-row">
+                        <button onclick="approveBrowserAgentPlan('once')">Approve plan once</button>
+                        <button onclick="approveBrowserAgentPlan('all_session')">Allow all this session</button>
+                        <button onclick="reviewBrowserAgentCommands()">Review per command</button>
+                    </div>
+                `;
+            } else {
+                approvalsEl.style.display = 'none';
+                approvalsEl.innerHTML = '';
+            }
+
+            const commands = browserAgentState?.commands || [];
+            if (commands.length > 0) {
+                commandsEl.style.display = 'grid';
+                commandsEl.innerHTML = commands.map((cmd) => {
+                    const isAwaiting = state === 'awaiting_approval' && cmd.state === 'awaiting_approval' && (!pendingCommandId || cmd.id === pendingCommandId);
+                    const commandActions = isAwaiting ? `
+                        <div class="browser-agent-command-actions">
+                            <button onclick="approveBrowserAgentCommand('${escapeHtml(cmd.id)}', 'once')">Once</button>
+                            <button onclick="approveBrowserAgentCommand('${escapeHtml(cmd.id)}', 'command')">Exact/session</button>
+                            <button onclick="approveBrowserAgentCommand('${escapeHtml(cmd.id)}', 'wildcard')">Wildcard/session</button>
+                            <button onclick="approveBrowserAgentCommand('${escapeHtml(cmd.id)}', 'all_session')">Allow all/session</button>
+                        </div>
+                    ` : '';
+                    return `
+                        <article class="browser-agent-command browser-agent-command-${escapeHtml(cmd.state)}">
+                            <div class="browser-agent-command-top">
+                                <span class="browser-agent-command-status">${escapeHtml(cmd.state)}</span>
+                            </div>
+                            <code>${escapeHtml(cmd.command)}</code>
+                            ${cmd.reason ? `<p>${escapeHtml(cmd.reason)}</p>` : ''}
+                            ${commandActions}
+                        </article>
+                    `;
+                }).join('');
+            } else {
+                commandsEl.style.display = 'none';
+                commandsEl.innerHTML = '';
+            }
+
+            stopBtn.style.display = ['thinking', 'awaiting_approval', 'running'].includes(state) ? 'inline-block' : 'none';
+        }
+
+        function updateBrowserAgent(status) {
+            browserAgentState = {
+                status: 'idle',
+                commands: [],
+                ...status,
+            };
+            renderBrowserAgentPanel();
+        }
+
+        function showBrowserAgentNotice(message) {
+            updateBrowserAgent({
+                ...browserAgentState,
+                status: browserAgentState?.status || browserAgentState?.state || 'idle',
+                notice: message,
+            });
+        }
+
+        function clearBrowserAgentNotice() {
+            if (!browserAgentState?.notice) {
+                return;
+            }
+            const nextState = { ...browserAgentState };
+            delete nextState.notice;
+            browserAgentState = nextState;
+            renderBrowserAgentPanel();
+        }
+
+        function submitBrowserAsk(prompt) {
+            if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+                updateStatus('Not connected', 'error');
+                return;
+            }
+
+            ws.send(JSON.stringify({
+                browser_agent: {
+                    submit: {
+                        prompt,
+                        provider: defaultProvider,
+                    }
+                }
+            }));
+            updateBrowserAgent({
+                status: 'thinking',
+                prompt,
+                summary: 'Thinking…',
+                commands: [],
+            });
+        }
+
+        function approveBrowserAgentPlan(scope) {
+            if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+            ws.send(JSON.stringify({ browser_agent: { approve: { target: 'plan', scope } } }));
+        }
+
+        function reviewBrowserAgentCommands() {
+            if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+            ws.send(JSON.stringify({ browser_agent: { approve: { target: 'review', scope: 'once' } } }));
+        }
+
+        function approveBrowserAgentCommand(commandId, scope) {
+            if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+            const command = (browserAgentState?.commands || []).find((item) => item.id === commandId);
+            const payload = { target: 'command', scope, command_ids: [commandId] };
+            if (scope === 'wildcard') {
+                const suggested = deriveWildcardPattern(command?.command || '');
+                const pattern = window.prompt('Wildcard pattern to approve for this session (example: cat*)', suggested);
+                if (!pattern) {
+                    return;
+                }
+                payload.pattern = pattern.trim();
+            }
+            ws.send(JSON.stringify({ browser_agent: { approve: payload } }));
+        }
+
+        function deriveWildcardPattern(commandText) {
+            const trimmed = (commandText || '').trim();
+            if (!trimmed) {
+                return 'cat*';
+            }
+            const firstToken = trimmed.split(/\s+/, 1)[0];
+            return `${firstToken}*`;
+        }
+
+        function stopBrowserAgentRun() {
+            if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+            ws.send(JSON.stringify({ browser_agent: { stop: true } }));
         }
 
         function rememberSessionMetadata(session) {
@@ -1618,6 +1883,7 @@
 
             // Handle terminal input with optimized sending
             term.onData((data) => {
+                updateBrowserDraftBufferFromInput(data);
                 if (isConnected && ws && ws.readyState === WebSocket.OPEN) {
                     // Always use JSON.stringify to properly escape all characters
                     ws.send(JSON.stringify({ input: data }));
@@ -1677,6 +1943,8 @@
 
         function closeCurrentWebSocket(skipReconnect = true) {
             cancelReconnect();
+            resetBrowserDraftBuffer();
+            updateBrowserAgent({ status: 'idle', commands: [] });
 
             if (!ws) {
                 return;
@@ -1799,6 +2067,8 @@
                             if (llmMonitorVisible) {
                                 addLLMEntry(data.llm_monitor.type, data.llm_monitor.data);
                             }
+                        } else if (data.browser_agent) {
+                            updateBrowserAgent(data.browser_agent);
                         }
                     } catch (e) {
                         console.error('Error parsing message:', e);
@@ -2258,6 +2528,7 @@
             }
 
             try {
+                updateBrowserDraftBufferFromInput(keyCode);
                 ws.send(JSON.stringify({ input: keyCode }));
                 console.log(`Sent ${keyName} key`);
 
@@ -2313,6 +2584,7 @@
             }
 
             try {
+                updateBrowserDraftBufferFromInput(keyCode);
                 ws.send(JSON.stringify({ input: keyCode }));
                 console.log(`Sent ${displayName} arrow key`);
 
@@ -2361,6 +2633,8 @@
 
             // Send Ctrl+C interrupt signal
             try {
+                resetBrowserDraftBuffer();
+                updateBrowserDraftBufferFromInput('\x03');
                 ws.send(JSON.stringify({ input: '\x03' }));
                 console.log('Sent Ctrl+C interrupt signal');
                 updateStatus('Interrupt sent', 'warning');
@@ -2422,6 +2696,8 @@
                 fetch(`${basePath}/reset/${clientId}`, { method: 'POST' })
                     .then(r => r.json())
                     .then(data => {
+                        resetBrowserDraftBuffer();
+                        updateBrowserAgent({ status: 'idle', commands: [] });
                         if (term) term.clear();
                         closeCurrentWebSocket();
                         setTimeout(async () => await connectWebSocket(), 500);
@@ -2486,17 +2762,39 @@
 
         // Update auth button visibility
         updateAuthButton();
+        renderBrowserAgentPanel();
 
         // Add keyboard event handling for clipboard operations
         document.addEventListener('keydown', (e) => {
+            const terminalContainer = document.getElementById('terminal-container');
+            const isTerminalFocused = terminalContainer.contains(document.activeElement) ||
+                document.activeElement === document.body ||
+                document.activeElement === terminalContainer;
+
+            if (e.altKey && e.key === 'Enter') {
+                if (isTerminalFocused && !isInputElement(document.activeElement)) {
+                    e.preventDefault();
+                    const notice = getAskModeNotice();
+                    if (notice) {
+                        showBrowserAgentNotice(notice);
+                        return;
+                    }
+
+                    clearBrowserAgentNotice();
+                    const prompt = browserDraftBuffer.trim();
+                    if (!prompt) {
+                        showBrowserAgentNotice('Type a line of shell input first, then press Alt+Enter.');
+                        return;
+                    }
+
+                    resetBrowserDraftBuffer();
+                    submitBrowserAsk(prompt);
+                }
+                return;
+            }
+
             // Handle Ctrl+C for interrupt (traditional terminal behavior)
             if (e.ctrlKey && e.key === 'c') {
-                // Check if the terminal has focus or if we're in the terminal area
-                const terminalContainer = document.getElementById('terminal-container');
-                const isTerminalFocused = terminalContainer.contains(document.activeElement) ||
-                    document.activeElement === document.body ||
-                    document.activeElement === terminalContainer;
-
                 // Only intercept in terminal context - let normal copy work in modals/inputs
                 if (isTerminalFocused && !isInputElement(document.activeElement)) {
                     e.preventDefault(); // Prevent default browser copy behavior
@@ -2506,11 +2804,6 @@
 
             // Handle Ctrl+V for paste in terminal
             if (e.ctrlKey && e.key === 'v') {
-                const terminalContainer = document.getElementById('terminal-container');
-                const isTerminalFocused = terminalContainer.contains(document.activeElement) ||
-                    document.activeElement === document.body ||
-                    document.activeElement === terminalContainer;
-
                 // Only intercept in terminal context
                 if (isTerminalFocused && !isInputElement(document.activeElement)) {
                     e.preventDefault(); // Prevent default paste
@@ -2541,8 +2834,12 @@
             if (navigator.clipboard && window.isSecureContext) {
                 navigator.clipboard.readText().then(text => {
                     if (text && text.trim().length > 0) {
+                        if (text.includes('\n') || text.includes('\r')) {
+                            markBrowserDraftUntrusted('Ask mode is unavailable after multiline paste until you submit or clear the line.');
+                        }
                         // Send each character to maintain proper terminal behavior
                         for (const char of text) {
+                            updateBrowserDraftBufferFromInput(char);
                             ws.send(JSON.stringify({ input: char }));
                         }
                         console.log('Pasted text from clipboard:', text.substring(0, 50) + '...');

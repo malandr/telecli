@@ -22,6 +22,7 @@ async def test_web_app_lifespan_preserves_injected_session_manager():
     """The web app should keep an injected shared session manager alive."""
     manager = FakeSessionManager()
     original_manager = web_app.session_manager
+    original_managed = web_app._session_manager_managed
 
     try:
         web_app.set_session_manager(manager, managed=False)
@@ -33,4 +34,4 @@ async def test_web_app_lifespan_preserves_injected_session_manager():
         assert web_app.session_manager is manager
         assert manager.close_all_calls == 0
     finally:
-        web_app.set_session_manager(original_manager, managed=False)
+        web_app.set_session_manager(original_manager, managed=original_managed)
