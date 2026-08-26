@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Global session manager
 session_manager: SessionManager = None
-_session_manager_managed = True  # lifespan handles lifecycle by default
+_session_manager_managed = False
 
 
 def _parse_positive_int(raw_value: str | None) -> int | None:
@@ -44,6 +44,18 @@ def set_session_manager(manager: SessionManager | None, *, managed: bool = False
     global session_manager, _session_manager_managed
     session_manager = manager
     _session_manager_managed = managed
+
+
+async def _parse_json_body(request: Request) -> dict:
+    """Parse a request body as JSON, tolerating missing Content-Length
+    (chunked transfer encoding) and empty bodies."""
+    body_bytes = await request.body()
+    if not body_bytes:
+        return {}
+    try:
+        return await request.json()
+    except json.JSONDecodeError:
+        return {}
 
 
 async def send_json_locked(websocket: WebSocket, payload: dict, send_lock: asyncio.Lock) -> bool:
@@ -75,14 +87,15 @@ def add_llm_monitor_entry(entry_type: str, data: dict):
 async def lifespan(app: FastAPI):
     """Lifespan context manager"""
     global session_manager
-    if _session_manager_managed:
-        session_manager = SessionManager()
+    if session_manager is None:
+        set_session_manager(SessionManager(), managed=True)
     session_manager.set_monitor_callback(add_llm_monitor_entry)
 
     logger.info("Web app started")
     yield
     if _session_manager_managed and session_manager is not None:
         await session_manager.close_all()
+        set_session_manager(None, managed=False)
     logger.info("Web app stopped")
 
 
@@ -150,7 +163,7 @@ async def get_tmux_sessions():
 @router.post("/api/tmux/sessions")
 async def create_tmux_session(request: Request):
     """Create a new tmux session and import it into TeleCLI."""
-    body = await request.json() if request.headers.get("content-length") else {}
+    body = await _parse_json_body(request)
     tmux_session_name = body.get("name", "").strip()
     if not tmux_session_name:
         raise HTTPException(status_code=400, detail="tmux session name is required")
@@ -165,7 +178,7 @@ async def create_tmux_session(request: Request):
 @router.post("/api/sessions")
 async def create_session(request: Request):
     """Create a new TeleCLI session entry."""
-    body = await request.json() if request.headers.get("content-length") else {}
+    body = await _parse_json_body(request)
     name = body.get("name", "").strip() or None
     result = session_manager.create_session_entry(name=name)
     return {"session": result}
@@ -198,7 +211,9 @@ async def detach_tmux_session(session_id: str):
     try:
         result = await session_manager.detach_tmux_session(session_id)
         return {"session": result}
-    except (KeyError, ValueError) as e:
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 

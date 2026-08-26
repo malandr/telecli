@@ -514,7 +514,8 @@ class SessionManager:
     async def execute_session_command(self, session_id: str, command: str, timeout: Optional[float] = None) -> str:
         """Execute a command via the session marker flow and wait for completion."""
         session = await self.get_session(session_id)
-        return await session.send_command(command, timeout=timeout or Config.TERMINAL_TIMEOUT)
+        resolved_timeout = Config.TERMINAL_TIMEOUT if timeout is None else timeout
+        return await session.send_command(command, timeout=resolved_timeout)
 
     async def enable_ai_proxy(
         self,

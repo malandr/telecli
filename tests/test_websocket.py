@@ -668,7 +668,7 @@ async def _fake_get_session(_session_id: str):
     return _FakeBrowserAgentSession()
 
 
-async def _fake_get_output_stream(_session_id: str):
+async def _fake_get_output_stream(_session_id: str, *, rows: int | None = None, cols: int | None = None):
     if False:
         yield ""
 
