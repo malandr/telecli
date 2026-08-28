@@ -49,6 +49,72 @@ TeleCLI is a web-based terminal interface that allows users to interact with com
    pip install -r requirements.txt
    ```
 
+### Linux
+
+For Linux hosts, use the dedicated installer to clone TeleCLI into `~/.local/share/telecli`, create a virtualenv, copy `.env.sample` to `.env` if needed, and install a `telecli` launcher into `~/.local/bin`.
+
+From a checkout:
+```bash
+./scripts/install-linux.sh
+telecli start
+telecli status
+```
+
+Without cloning first:
+```bash
+curl -fsSL https://raw.githubusercontent.com/malandr/telecli/main/scripts/install-linux.sh | bash
+telecli start
+```
+
+On a fresh install the installer will guide you through the key `.env` settings:
+- Telegram bot token
+- Allowed Telegram user IDs
+- Web host binding (`127.0.0.1` vs `0.0.0.0`)
+- Web port
+- Whether web auth is required
+- Auth token (auto-generated if left blank)
+- Whether AI proxy should start enabled
+- Which AI proxy provider to use
+- Whether TeleCLI should start at startup/login through a user `systemd` service
+
+For scripted installs, you can skip prompts and preseed answers:
+```bash
+TELECLI_AUTO_CONFIG=1 \
+TELECLI_INSTALL_TELEGRAM_BOT_TOKEN="" \
+TELECLI_INSTALL_WEB_HOST=127.0.0.1 \
+TELECLI_INSTALL_WEB_PORT=8000 \
+TELECLI_INSTALL_AUTH_REQUIRED=true \
+./scripts/install-linux.sh
+```
+
+If you opt in to start at startup, the installer writes `~/.config/systemd/user/telecli.service`, runs `systemctl --user daemon-reload`, enables it, and starts it immediately. If `systemctl --user` is unavailable, the installer keeps going and leaves the service file in place for manual setup.
+
+### Windows (WSL2)
+
+Windows support is currently delivered through WSL2 so TeleCLI can keep using a real Linux shell and tmux.
+
+1. Install WSL2 with an Ubuntu distro if you do not already have one:
+   ```powershell
+   wsl --install -d Ubuntu
+   ```
+2. Run the Windows bootstrapper:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
+   ```
+3. Start TeleCLI inside WSL:
+   ```powershell
+   wsl telecli-wsl start
+   ```
+4. Inspect status or logs from Windows:
+   ```powershell
+   wsl telecli-wsl status
+   wsl telecli-wsl logs
+   ```
+
+The installer clones TeleCLI into `~/.local/share/telecli` inside your WSL distro, creates a virtualenv, copies `.env.sample` to `.env` when needed, and installs a `telecli-wsl` launcher in `~/.local/bin`.
+It asks the same setup questions as the Linux installer, and you can preseed them with the same `TELECLI_AUTO_CONFIG=1` and `TELECLI_INSTALL_*` environment variables before running the WSL-side script.
+If you enable start at startup there, it uses a user `systemd` service inside WSL. This requires a systemd-enabled WSL distro.
+
 ## Configuration
 
 TeleCLI uses environment variables for configuration. Copy `.env.sample` to `.env` and configure the following key settings:

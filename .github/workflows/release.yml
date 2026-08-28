@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify installer assets
+        run: |
+          test -f install-windows.ps1
+          test -f scripts/install-linux.sh
+          test -f scripts/install-wsl.sh
+
+      - name: Build release bundle
+        run: |
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="telecli-${GITHUB_REF_NAME}/" -o "dist/telecli-${GITHUB_REF_NAME}-source.tar.gz" HEAD
+          cp install-windows.ps1 dist/install-windows.ps1
+          cp scripts/install-linux.sh dist/install-linux.sh
+          cp scripts/install-wsl.sh dist/install-wsl.sh
+          cp README.md dist/README.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/install-windows.ps1
+            dist/install-linux.sh
+            dist/install-wsl.sh
+            dist/telecli-${{ github.ref_name }}-source.tar.gz
